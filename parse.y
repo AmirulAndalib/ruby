@@ -1143,7 +1143,7 @@ static rb_node_defs_t *rb_node_defs_new(struct parser_params *p, NODE *nd_recv, 
 static rb_node_alias_t *rb_node_alias_new(struct parser_params *p, NODE *nd_1st, NODE *nd_2nd, const YYLTYPE *loc, const YYLTYPE *keyword_loc);
 static rb_node_valias_t *rb_node_valias_new(struct parser_params *p, ID nd_alias, ID nd_orig, const YYLTYPE *loc, const YYLTYPE *keyword_loc);
 static rb_node_undef_t *rb_node_undef_new(struct parser_params *p, NODE *nd_undef, const YYLTYPE *loc);
-static rb_node_class_t *rb_node_class_new(struct parser_params *p, NODE *nd_cpath, NODE *nd_body, NODE *nd_super, const YYLTYPE *loc);
+static rb_node_class_t *rb_node_class_new(struct parser_params *p, NODE *nd_cpath, NODE *nd_body, NODE *nd_super, const YYLTYPE *loc, const YYLTYPE *class_keyword_loc, const YYLTYPE *inheritance_operator_loc, const YYLTYPE *end_keyword_loc);
 static rb_node_module_t *rb_node_module_new(struct parser_params *p, NODE *nd_cpath, NODE *nd_body, const YYLTYPE *loc);
 static rb_node_sclass_t *rb_node_sclass_new(struct parser_params *p, NODE *nd_recv, NODE *nd_body, const YYLTYPE *loc);
 static rb_node_colon2_t *rb_node_colon2_new(struct parser_params *p, NODE *nd_head, ID nd_mid, const YYLTYPE *loc);
@@ -1251,7 +1251,7 @@ static rb_node_error_t *rb_node_error_new(struct parser_params *p, const YYLTYPE
 #define NEW_ALIAS(n,o,loc,k_loc) (NODE *)rb_node_alias_new(p,n,o,loc,k_loc)
 #define NEW_VALIAS(n,o,loc,k_loc) (NODE *)rb_node_valias_new(p,n,o,loc,k_loc)
 #define NEW_UNDEF(i,loc) (NODE *)rb_node_undef_new(p,i,loc)
-#define NEW_CLASS(n,b,s,loc) (NODE *)rb_node_class_new(p,n,b,s,loc)
+#define NEW_CLASS(n,b,s,loc,ck_loc,io_loc,ek_loc) (NODE *)rb_node_class_new(p,n,b,s,loc,ck_loc,io_loc,ek_loc)
 #define NEW_MODULE(n,b,loc) (NODE *)rb_node_module_new(p,n,b,loc)
 #define NEW_SCLASS(r,b,loc) (NODE *)rb_node_sclass_new(p,r,b,loc)
 #define NEW_COLON2(c,i,loc) (NODE *)rb_node_colon2_new(p,c,i,loc)
@@ -2795,7 +2795,7 @@ rb_parser_ary_free(rb_parser_t *p, rb_parser_ary_t *ary)
 %type <node> p_args p_args_head p_args_tail p_args_post p_arg p_rest
 %type <node> p_value p_primitive p_primitive_value p_variable p_var_ref p_expr_ref p_const
 %type <node> p_kwargs p_kwarg p_kw
-%type <id>   keyword_variable user_variable sym operation operation2 operation3
+%type <id>   keyword_variable user_variable sym operation2 operation3
 %type <id>   cname fname op f_rest_arg f_block_arg opt_f_block_arg f_norm_arg f_bad_arg
 %type <id>   f_kwrest f_label f_arg_asgn call_op call_op2 reswords relop dot_or_colon
 %type <id>   p_kwrest p_kwnorest p_any_kwrest p_kw_label
@@ -2910,9 +2910,6 @@ rb_parser_ary_free(rb_parser_t *p, rb_parser_ary_t *ary)
                 | keyword_variable
                 ;
 
-%rule %inline inline_operation : ident_or_const
-                               | tFID
-                               ;
 /*
  *	parameterizing rules
  */
@@ -3781,7 +3778,7 @@ cpath		: tCOLON3 cname
                     }
                 ;
 
-fname		: inline_operation
+fname		: operation
                 | op
                     {
                         SET_LEX_STATE(EXPR_ENDFN);
@@ -4555,7 +4552,12 @@ primary         : inline_primary
                   bodystmt
                   k_end
                     {
-                        $$ = NEW_CLASS($cpath, $bodystmt, $superclass, &@$);
+                        YYLTYPE inheritance_operator_loc = NULL_LOC;
+                        if ($superclass) {
+                            inheritance_operator_loc = @superclass;
+                            inheritance_operator_loc.end_pos.column = inheritance_operator_loc.beg_pos.column + 1;
+                        }
+                        $$ = NEW_CLASS($cpath, $bodystmt, $superclass, &@$, &@k_class, &inheritance_operator_loc, &@k_end);
                         nd_set_line(RNODE_CLASS($$)->nd_body, @k_end.end_pos.lineno);
                         set_line_body($bodystmt, @superclass.end_pos.lineno);
                         nd_set_line($$, @superclass.end_pos.lineno);
@@ -5086,9 +5088,6 @@ bvar		: tIDENTIFIER
                     /*% ripper: $:1 %*/
                     }
                 | f_bad_arg
-                    {
-                        $$ = 0;
-                    }
                 ;
 
 max_numparam	:   {
@@ -6714,8 +6713,9 @@ assoc		: arg_value tASSOC arg_value
                     }
                 ;
 
-operation	: inline_operation
-                ;
+%rule %inline operation : ident_or_const
+                        | tFID
+                        ;
 
 operation2	: operation
                 | op
@@ -11440,7 +11440,7 @@ rb_node_unless_new(struct parser_params *p, NODE *nd_cond, NODE *nd_body, NODE *
 }
 
 static rb_node_class_t *
-rb_node_class_new(struct parser_params *p, NODE *nd_cpath, NODE *nd_body, NODE *nd_super, const YYLTYPE *loc)
+rb_node_class_new(struct parser_params *p, NODE *nd_cpath, NODE *nd_body, NODE *nd_super, const YYLTYPE *loc, const YYLTYPE *class_keyword_loc, const YYLTYPE *inheritance_operator_loc, const YYLTYPE *end_keyword_loc)
 {
     /* Keep the order of node creation */
     NODE *scope = NEW_SCOPE(0, nd_body, loc);
@@ -11448,6 +11448,9 @@ rb_node_class_new(struct parser_params *p, NODE *nd_cpath, NODE *nd_body, NODE *
     n->nd_cpath = nd_cpath;
     n->nd_body = scope;
     n->nd_super = nd_super;
+    n->class_keyword_loc = *class_keyword_loc;
+    n->inheritance_operator_loc = *inheritance_operator_loc;
+    n->end_keyword_loc = *end_keyword_loc;
 
     return n;
 }
