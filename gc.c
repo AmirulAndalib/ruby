@@ -966,7 +966,6 @@ rb_objspace_alloc(void)
 
     void *objspace = rb_gc_impl_objspace_alloc();
     ruby_current_vm_ptr->gc.objspace = objspace;
-
     rb_gc_impl_objspace_init(objspace);
     rb_gc_impl_stress_set(objspace, initial_stress);
 
