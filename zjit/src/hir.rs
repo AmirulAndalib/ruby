@@ -778,12 +778,13 @@ pub enum Insn {
 
     /// Call a C function without pushing a frame
     /// `name` is for printing purposes only
-    CCall { cfunc: *const u8, args: Vec<InsnId>, name: ID, return_type: Type, elidable: bool },
+    CCall { cfunc: *const u8, recv: InsnId, args: Vec<InsnId>, name: ID, return_type: Type, elidable: bool },
 
     /// Call a C function that pushes a frame
     CCallWithFrame {
         cd: *const rb_call_data, // cd for falling back to SendWithoutBlock
         cfunc: *const u8,
+        recv: InsnId,
         args: Vec<InsnId>,
         cme: *const rb_callable_method_entry_t,
         name: ID,
@@ -804,6 +805,7 @@ pub enum Insn {
         state: InsnId,
         return_type: Type,
         elidable: bool,
+        blockiseq: Option<IseqPtr>,
     },
 
     /// Un-optimized fallback implementation (dynamic dispatch) for send-ish instructions
@@ -1179,8 +1181,8 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
                 }
                 Ok(())
             }
-            Insn::SendForward { cd, args, blockiseq, .. } => {
-                write!(f, "SendForward {:p}, :{}", self.ptr_map.map_ptr(blockiseq), ruby_call_method_name(*cd))?;
+            Insn::SendForward { recv, cd, args, blockiseq, .. } => {
+                write!(f, "SendForward {recv}, {:p}, :{}", self.ptr_map.map_ptr(blockiseq), ruby_call_method_name(*cd))?;
                 for arg in args {
                     write!(f, ", {arg}")?;
                 }
@@ -1239,15 +1241,15 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             Insn::GetConstantPath { ic, .. } => { write!(f, "GetConstantPath {:p}", self.ptr_map.map_ptr(ic)) },
             Insn::IsBlockGiven => { write!(f, "IsBlockGiven") },
             Insn::FixnumBitCheck {val, index} => { write!(f, "FixnumBitCheck {val}, {index}") },
-            Insn::CCall { cfunc, args, name, return_type: _, elidable: _ } => {
-                write!(f, "CCall {}@{:p}", name.contents_lossy(), self.ptr_map.map_ptr(cfunc))?;
+            Insn::CCall { cfunc, recv, args, name, return_type: _, elidable: _ } => {
+                write!(f, "CCall {recv}, :{}@{:p}", name.contents_lossy(), self.ptr_map.map_ptr(cfunc))?;
                 for arg in args {
                     write!(f, ", {arg}")?;
                 }
                 Ok(())
             },
-            Insn::CCallWithFrame { cfunc, args, name, blockiseq, .. } => {
-                write!(f, "CCallWithFrame {}@{:p}", name.contents_lossy(), self.ptr_map.map_ptr(cfunc))?;
+            Insn::CCallWithFrame { cfunc, recv, args, name, blockiseq, .. } => {
+                write!(f, "CCallWithFrame {recv}, :{}@{:p}", name.contents_lossy(), self.ptr_map.map_ptr(cfunc))?;
                 for arg in args {
                     write!(f, ", {arg}")?;
                 }
@@ -1256,8 +1258,8 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
                 }
                 Ok(())
             },
-            Insn::CCallVariadic { cfunc,  recv, args, name, .. } => {
-                write!(f, "CCallVariadic {}@{:p}, {recv}", name.contents_lossy(), self.ptr_map.map_ptr(cfunc))?;
+            Insn::CCallVariadic { cfunc, recv, args, name, .. } => {
+                write!(f, "CCallVariadic {recv}, :{}@{:p}", name.contents_lossy(), self.ptr_map.map_ptr(cfunc))?;
                 for arg in args {
                     write!(f, ", {arg}")?;
                 }
@@ -1908,10 +1910,11 @@ impl Function {
             &HashAref { hash, key, state } => HashAref { hash: find!(hash), key: find!(key), state },
             &ObjectAlloc { val, state } => ObjectAlloc { val: find!(val), state },
             &ObjectAllocClass { class, state } => ObjectAllocClass { class, state: find!(state) },
-            &CCall { cfunc, ref args, name, return_type, elidable } => CCall { cfunc, args: find_vec!(args), name, return_type, elidable },
-            &CCallWithFrame { cd, cfunc, ref args, cme, name, state, return_type, elidable, blockiseq } => CCallWithFrame {
+            &CCall { cfunc, recv, ref args, name, return_type, elidable } => CCall { cfunc, recv: find!(recv), args: find_vec!(args), name, return_type, elidable },
+            &CCallWithFrame { cd, cfunc, recv, ref args, cme, name, state, return_type, elidable, blockiseq } => CCallWithFrame {
                 cd,
                 cfunc,
+                recv: find!(recv),
                 args: find_vec!(args),
                 cme,
                 name,
@@ -1920,8 +1923,8 @@ impl Function {
                 elidable,
                 blockiseq,
             },
-            &CCallVariadic { cfunc, recv, ref args, cme, name, state, return_type, elidable } => CCallVariadic {
-                cfunc, recv: find!(recv), args: find_vec!(args), cme, name, state, return_type, elidable
+            &CCallVariadic { cfunc, recv, ref args, cme, name, state, return_type, elidable, blockiseq } => CCallVariadic {
+                cfunc, recv: find!(recv), args: find_vec!(args), cme, name, state, return_type, elidable, blockiseq
             },
             &Defined { op_type, obj, pushval, v, state } => Defined { op_type, obj, pushval, v: find!(v), state: find!(state) },
             &DefinedIvar { self_val, pushval, id, state } => DefinedIvar { self_val: find!(self_val), pushval, id, state },
@@ -2958,7 +2961,7 @@ impl Function {
             send: Insn,
             send_insn_id: InsnId,
         ) -> Result<(), ()> {
-            let Insn::Send { mut recv, cd, blockiseq, mut args, state, .. } = send else {
+            let Insn::Send { mut recv, cd, blockiseq, args, state, .. } = send else {
                 return Err(());
             };
 
@@ -2989,25 +2992,29 @@ impl Function {
                 return Err(());
             }
 
-            // Find the `argc` (arity) of the C method, which describes the parameters it expects
+            let ci_flags = unsafe { vm_ci_flag(call_info) };
+
+            // When seeing &block argument, fall back to dynamic dispatch for now
+            // TODO: Support block forwarding
+            if unspecializable_call_type(ci_flags) {
+                fun.count_complex_call_features(block, ci_flags);
+                fun.set_dynamic_send_reason(send_insn_id, ComplexArgPass);
+                return Err(());
+            }
+
+            let blockiseq = if blockiseq.is_null() { None } else { Some(blockiseq) };
+
             let cfunc = unsafe { get_cme_def_body_cfunc(cme) };
+            // Find the `argc` (arity) of the C method, which describes the parameters it expects
             let cfunc_argc = unsafe { get_mct_argc(cfunc) };
+            let cfunc_ptr = unsafe { get_mct_func(cfunc) }.cast();
+
             match cfunc_argc {
                 0.. => {
                     // (self, arg0, arg1, ..., argc) form
                     //
                     // Bail on argc mismatch
                     if argc != cfunc_argc as u32 {
-                        return Err(());
-                    }
-
-                    let ci_flags = unsafe { vm_ci_flag(call_info) };
-
-                    // When seeing &block argument, fall back to dynamic dispatch for now
-                    // TODO: Support block forwarding
-                    if unspecializable_call_type(ci_flags) {
-                        fun.count_complex_call_features(block, ci_flags);
-                        fun.set_dynamic_send_reason(send_insn_id, ComplexArgPass);
                         return Err(());
                     }
 
@@ -3023,18 +3030,15 @@ impl Function {
                         fun.insn_types[recv.0] = fun.infer_type(recv);
                     }
 
-                    let blockiseq = if blockiseq.is_null() { None } else { Some(blockiseq) };
-
                     // Emit a call
                     let cfunc = unsafe { get_mct_func(cfunc) }.cast();
-                    let mut cfunc_args = vec![recv];
-                    cfunc_args.append(&mut args);
 
                     let name = rust_str_to_id(&qualified_method_name(unsafe { (*cme).owner }, unsafe { (*cme).called_id }));
                     let ccall = fun.push_insn(block, Insn::CCallWithFrame {
                         cd,
                         cfunc,
-                        args: cfunc_args,
+                        recv,
+                        args,
                         cme,
                         name,
                         state,
@@ -3047,9 +3051,37 @@ impl Function {
                 }
                 // Variadic method
                 -1 => {
+                    // The method gets a pointer to the first argument
                     // func(int argc, VALUE *argv, VALUE recv)
-                    fun.set_dynamic_send_reason(send_insn_id, SendCfuncVariadic);
-                    Err(())
+                    fun.gen_patch_points_for_optimized_ccall(block, recv_class, method_id, cme, state);
+
+                    if recv_class.instance_can_have_singleton_class() {
+                        fun.push_insn(block, Insn::PatchPoint { invariant: Invariant::NoSingletonClass { klass: recv_class }, state });
+                    }
+                    if let Some(profiled_type) = profiled_type {
+                        // Guard receiver class
+                        recv = fun.push_insn(block, Insn::GuardType { val: recv, guard_type: Type::from_profiled_type(profiled_type), state });
+                        fun.insn_types[recv.0] = fun.infer_type(recv);
+                    }
+
+                    if get_option!(stats) {
+                        count_not_inlined_cfunc(fun, block, cme);
+                    }
+
+                    let ccall = fun.push_insn(block, Insn::CCallVariadic {
+                        cfunc: cfunc_ptr,
+                        recv,
+                        args,
+                        cme,
+                        name: method_id,
+                        state,
+                        return_type: types::BasicObject,
+                        elidable: false,
+                        blockiseq
+                    });
+
+                    fun.make_equal_to(send_insn_id, ccall);
+                    Ok(())
                 }
                 -2 => {
                     // (self, args_ruby_array)
@@ -3068,7 +3100,7 @@ impl Function {
             send: Insn,
             send_insn_id: InsnId,
         ) -> Result<(), ()> {
-            let Insn::SendWithoutBlock { mut recv, cd, mut args, state, .. } = send else {
+            let Insn::SendWithoutBlock { mut recv, cd, args, state, .. } = send else {
                 return Err(());
             };
 
@@ -3161,14 +3193,12 @@ impl Function {
                     // No inlining; emit a call
                     let cfunc = unsafe { get_mct_func(cfunc) }.cast();
                     let name = rust_str_to_id(&qualified_method_name(unsafe { (*cme).owner }, unsafe { (*cme).called_id }));
-                    let mut cfunc_args = vec![recv];
-                    cfunc_args.append(&mut args);
                     let return_type = props.return_type;
                     let elidable = props.elidable;
                     // Filter for a leaf and GC free function
                     if props.leaf && props.no_gc {
                         fun.push_insn(block, Insn::IncrCounter(Counter::inline_cfunc_optimized_send_count));
-                        let ccall = fun.push_insn(block, Insn::CCall { cfunc, args: cfunc_args, name, return_type, elidable });
+                        let ccall = fun.push_insn(block, Insn::CCall { cfunc, recv, args, name, return_type, elidable });
                         fun.make_equal_to(send_insn_id, ccall);
                     } else {
                         if get_option!(stats) {
@@ -3177,7 +3207,8 @@ impl Function {
                         let ccall = fun.push_insn(block, Insn::CCallWithFrame {
                             cd,
                             cfunc,
-                            args: cfunc_args,
+                            recv,
+                            args,
                             cme,
                             name,
                             state,
@@ -3252,6 +3283,7 @@ impl Function {
                             state,
                             return_type,
                             elidable,
+                            blockiseq: None,
                         });
 
                         fun.make_equal_to(send_insn_id, ccall);
@@ -3631,19 +3663,22 @@ impl Function {
             | &Insn::SendForward { recv, ref args, state, .. }
             | &Insn::SendWithoutBlock { recv, ref args, state, .. }
             | &Insn::CCallVariadic { recv, ref args, state, .. }
+            | &Insn::CCallWithFrame { recv, ref args, state, .. }
             | &Insn::SendWithoutBlockDirect { recv, ref args, state, .. }
             | &Insn::InvokeSuper { recv, ref args, state, .. } => {
                 worklist.push_back(recv);
                 worklist.extend(args);
                 worklist.push_back(state);
             }
-            &Insn::CCallWithFrame { ref args, state, .. }
-            | &Insn::InvokeBuiltin { ref args, state, .. }
+            &Insn::InvokeBuiltin { ref args, state, .. }
             | &Insn::InvokeBlock { ref args, state, .. } => {
                 worklist.extend(args);
                 worklist.push_back(state)
             }
-            Insn::CCall { args, .. } => worklist.extend(args),
+            &Insn::CCall { recv, ref args, .. } => {
+                worklist.push_back(recv);
+                worklist.extend(args);
+            }
             &Insn::GetIvar { self_val, state, .. } | &Insn::DefinedIvar { self_val, state, .. } => {
                 worklist.push_back(self_val);
                 worklist.push_back(state);
@@ -4197,7 +4232,6 @@ impl Function {
             | Insn::IncrCounter { .. }
             | Insn::IncrCounterPtr { .. }
             | Insn::CheckInterrupts { .. }
-            | Insn::CCall { .. }
             | Insn::GetClassVar { .. }
             | Insn::GetSpecialNumber { .. }
             | Insn::GetSpecialSymbol { .. }
@@ -4245,6 +4279,8 @@ impl Function {
             | Insn::Send { recv, ref args, .. }
             | Insn::SendForward { recv, ref args, .. }
             | Insn::InvokeSuper { recv, ref args, .. }
+            | Insn::CCall { recv, ref args, .. }
+            | Insn::CCallWithFrame { recv, ref args, .. }
             | Insn::CCallVariadic { recv, ref args, .. }
             | Insn::ArrayInclude { target: recv, elements: ref args, .. } => {
                 self.assert_subtype(insn_id, recv, types::BasicObject)?;
@@ -4254,8 +4290,7 @@ impl Function {
                 Ok(())
             }
             // Instructions with a Vec of Ruby objects
-            Insn::CCallWithFrame { ref args, .. }
-            | Insn::InvokeBuiltin { ref args, .. }
+            Insn::InvokeBuiltin { ref args, .. }
             | Insn::InvokeBlock { ref args, .. }
             | Insn::NewArray { elements: ref args, .. }
             | Insn::ArrayHash { elements: ref args, .. }
